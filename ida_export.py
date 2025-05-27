@@ -24,10 +24,26 @@ import idautils
 import idaapi
 import json
 
+# Import for newer IDA versions
+try:
+    from ida_kernwin import ask_file
+except ImportError:
+    # For older versions, this won't work in IDA 9.1, so we'll use idaapi
+    ask_file = None
+
 DefaultSectionSemantics = 0
 ReadOnlyCodeSectionSemantics = 1
 ReadOnlyDataSectionSemantics = 2
 ReadWriteDataSectionSemantics = 3
+
+
+def get_file_dialog():
+    """Get filename using available dialog method"""
+    if ask_file:
+        return ask_file(1, "*.json", "Export file name")
+    else:
+        # Use idaapi for newer versions
+        return idaapi.ask_file(1, "*.json", "Export file name")
 
 
 def linearize_comment(ea, function_comment=False):
@@ -35,11 +51,11 @@ def linearize_comment(ea, function_comment=False):
     repeatable_comment = ""
 
     if function_comment:
-        regular_comment = idc.GetFunctionCmt(ea, 0)
-        repeatable_comment = idc.GetFunctionCmt(ea, 1)
+        regular_comment = idc.get_func_cmt(ea, 0)
+        repeatable_comment = idc.get_func_cmt(ea, 1)
     else:
-        regular_comment = idc.Comment(ea)
-        repeatable_comment = idc.RptCmt(ea)
+        regular_comment = idc.get_cmt(ea, 0)
+        repeatable_comment = idc.get_cmt(ea, 1)
 
     if regular_comment is None and repeatable_comment is None:
         return None
@@ -51,9 +67,8 @@ def linearize_comment(ea, function_comment=False):
         if len(regular_comment) == 0:
             return repeatable_comment
         if len(repeatable_comment) == 0:
-            return repeatable_comment
+            return regular_comment
         return regular_comment + "\n" + repeatable_comment
-    return None
 
 
 def main(fileName):
@@ -71,49 +86,69 @@ def main(fileName):
     # Record segment details
     for ea in idautils.Segments():
         cur_seg = {}
-        cur_seg["start"] = idc.SegStart(ea)
-        cur_seg["end"] = idc.SegEnd(ea)
-        cur_seg["name"] = idc.SegName(ea)
         seg = idaapi.getseg(ea)
-        cur_seg["r"] = (seg.perm & idaapi.SEGPERM_READ) != 0
-        cur_seg["w"] = (seg.perm & idaapi.SEGPERM_WRITE) != 0
-        cur_seg["x"] = (seg.perm & idaapi.SEGPERM_EXEC) != 0
-        cur_seg["semantics"] = DefaultSectionSemantics
-        if seg.type == idaapi.SEG_CODE:
-            cur_seg["semantics"] = ReadOnlyCodeSectionSemantics
-        elif seg.type == idaapi.SEG_DATA or seg.type == idaapi.SEG_BSS:
-            if cur_seg["w"]:
-                cur_seg["semantics"] = ReadWriteDataSectionSemantics
-            else:
-                cur_seg["semantics"] = ReadOnlyDataSectionSemantics
+        if seg:
+            cur_seg["start"] = seg.start_ea
+            cur_seg["end"] = seg.end_ea
+            cur_seg["name"] = idaapi.get_segm_name(seg)
+            cur_seg["r"] = (seg.perm & idaapi.SEGPERM_READ) != 0
+            cur_seg["w"] = (seg.perm & idaapi.SEGPERM_WRITE) != 0
+            cur_seg["x"] = (seg.perm & idaapi.SEGPERM_EXEC) != 0
+            cur_seg["semantics"] = DefaultSectionSemantics
+            if seg.type == idaapi.SEG_CODE:
+                cur_seg["semantics"] = ReadOnlyCodeSectionSemantics
+            elif seg.type == idaapi.SEG_DATA or seg.type == idaapi.SEG_BSS:
+                if cur_seg["w"]:
+                    cur_seg["semantics"] = ReadWriteDataSectionSemantics
+                else:
+                    cur_seg["semantics"] = ReadOnlyDataSectionSemantics
+            
+            jsonValue["segments"].append(cur_seg)
 
     # Record function details
     for ea in idautils.Functions():
         cur_func = {}
         cur_func["start"] = ea
-        cur_func["end"] = idc.GetFunctionAttr(ea, idc.FUNCATTR_END)
+        
+        # Get function end address
+        f = idaapi.get_func(ea)
+        if f:
+            cur_func["end"] = f.end_ea
+        else:
+            cur_func["end"] = ea
+        
         cur_func["comment"] = linearize_comment(ea, True)
         cur_func["comments"] = {}
         for line_ea in idautils.Heads(ea, cur_func["end"]):
             line_comment = linearize_comment(line_ea)
             if line_comment is not None:
-                cur_func["comments"][line_comment] = line_ea
+                cur_func["comments"][line_ea] = line_comment
 
-        flags = idc.GetFunctionFlags(ea)
+        # Get function flags
+        flags = idc.get_func_flags(ea)
         cur_func["can_return"] = (flags & idc.FUNC_NORET) != idc.FUNC_NORET
         cur_func["thunk"] = False
-        f = idaapi.get_func(ea)
-        blocks =[]
-        for block in idaapi.FlowChart(f):
-            blocks.append([block.startEA, block.endEA])
+        
+        blocks = []
+        if f:
+            for block in idaapi.FlowChart(f):
+                blocks.append([block.start_ea, block.end_ea])
 
-            # IDA treats thunks as being part of the function they are tunking to
-            # Binary Ninja doesn't so only add the first basic block for all thunks
-            if flags & idc.FUNC_THUNK != 0:
-                cur_func["thunk"] = True
-                break
+                # IDA treats thunks as being part of the function they are thunking to
+                # Binary Ninja doesn't so only add the first basic block for all thunks
+                if flags & idc.FUNC_THUNK != 0:
+                    cur_func["thunk"] = True
+                    break
         cur_func["basic_blocks"] = blocks
-        jsonValue["functions"][idc.GetFunctionName(ea)] = cur_func
+        
+        # Get function name
+        func_name = idc.get_func_name(ea)
+        
+        # Skip functions with auto-generated names starting with "sub_"
+        if func_name.startswith("sub_"):
+            continue
+            
+        jsonValue["functions"][func_name] = cur_func
 
     # Record string details
     for string in idautils.Strings():
@@ -133,10 +168,10 @@ def main(fileName):
     # TODO: non-function comments
 
     with open(fileName, "wb") as f:
-        f.write(json.dumps(jsonValue, indent=4))
+        f.write(json.dumps(jsonValue, indent=4).encode('utf-8'))
 
     print("Exported idb to {}".format(fileName))
 
 
 if __name__ == "__main__":
-    main(idc.AskFile(1, "*.json", "Export file name"))
+    main(get_file_dialog())
