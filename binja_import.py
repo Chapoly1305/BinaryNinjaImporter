@@ -1,220 +1,243 @@
-#!/usr/bin/env python
-#  Copyright (c) 2015-2017 Vector 35 LLC
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to
-# deal in the Software without restriction, including without limitation the
-# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
-# sell copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-# IN THE SOFTWARE.
+#!/usr/bin/env python3
+"""
+Binary Ninja IDA Import Script
+Imports function names and comments from IDA Pro JSON export
+"""
 
 import json
-from optparse import OptionParser
-
-from binaryninja.binaryview import BinaryViewType
-from binaryninja.types import (Type, Symbol)
-from binaryninja.enums import (SymbolType, IntegerDisplayType, InstructionTextTokenType)
+import binaryninja
+from binaryninja.interaction import OpenFileNameField, get_form_input, ChoiceField
 from binaryninja.plugin import PluginCommand
-from binaryninja.plugin import BackgroundTaskThread
-from binaryninja.interaction import (ChoiceField, OpenFileNameField, get_form_input)
-from binaryninja.log import log_error
 
 
-def log(message, verbose):
-    if task is None:
+def import_ida_data(bv, json_file_path, import_functions=True, import_comments=True, verbose=True):
+    """
+    Import IDA Pro analysis data into Binary Ninja
+    
+    Args:
+        bv: Binary Ninja BinaryView object
+        json_file_path: Path to the JSON file exported from IDA Pro
+        import_functions: Whether to import function names
+        import_comments: Whether to import comments
+        verbose: Whether to print progress messages
+    
+    Returns:
+        tuple: (success: bool, error_message: str or None)
+    """
+    
+    def log(message):
         if verbose:
-            print message
-    else:
-        task.progress = message
-
-
-def import_ida(json_file, bv, options):
-    if json_file is None:
-        return False, "No json file specified"
-
-    imported = None
-
+            print(message)
+    
     try:
-        f = open(json_file, "rb")
-        imported = json.load(f)
-    except Exception as e:
-        return False, "Failed to parse json file {} {}".format(json_file, e)
-
-    resolved_functions = imported["functions"]
-    resolved_strings = imported["strings"]
-
-    # TODO: import segments
-    # TODO: Handle Conflicts
-
-    if options.import_functions:
-        log("Applying import data", options.verbose)
-        for name, rec in resolved_functions.items():
-            bv.add_function(rec["start"])
-            func = bv.get_function_at(rec["start"])
-            if name != ("sub_%x" % rec["start"]):
-                func.name = name
-
-            if options.import_comments:
-                if "comment" in rec:
-                    func.comment = rec["comment"]
-
-                if "comments" in rec:
-                    for comment, addr in rec["comments"].items():
-                        func.set_comment_at(addr, comment)
-
-            if "can_return" in rec:
-                func.can_return = rec["can_return"]
-
+        # Load the JSON data
+        log("Loading JSON file: {}".format(json_file_path))
+        with open(json_file_path, 'r', encoding='utf-8') as f:
+            ida_data = json.load(f)
+        
+        functions_data = ida_data.get("functions", {})
+        names_data = ida_data.get("names", {})
+        
+        log("Found {} functions in IDA export".format(len(functions_data)))
+        
+        # Wait for analysis to complete
+        log("Waiting for analysis to complete...")
         bv.update_analysis_and_wait()
+        
+        imported_functions = 0
+        renamed_functions = 0
+        imported_comments = 0
+        
+        # Process functions
+        if import_functions:
+            log("Importing function names...")
+            
+            for func_name, func_data in functions_data.items():
+                func_addr = func_data.get("start")
+                if func_addr is None:
+                    continue
+                
+                # Skip if function name starts with "sub_" (auto-generated)
+                if func_name.startswith("sub_"):
+                    continue
+                
+                # Create function if it doesn't exist
+                existing_func = bv.get_function_at(func_addr)
+                if existing_func is None:
+                    log("Creating function at 0x{:x}".format(func_addr))
+                    bv.add_function(func_addr)
+                    bv.update_analysis_and_wait()
+                    existing_func = bv.get_function_at(func_addr)
+                    imported_functions += 1
+                
+                if existing_func is not None:
+                    # Rename function if name is different and meaningful
+                    current_name = existing_func.name
+                    if current_name != func_name and not func_name.startswith("sub_"):
+                        log("Renaming function 0x{:x}: {} -> {}".format(func_addr, current_name, func_name))
+                        existing_func.name = func_name
+                        renamed_functions += 1
+                    
+                    # Import function comment
+                    if import_comments and "comment" in func_data and func_data["comment"]:
+                        comment = func_data["comment"]
+                        if comment.strip():
+                            log("Setting function comment for {}: {}".format(func_name, comment[:50] + "..." if len(comment) > 50 else comment))
+                            existing_func.comment = comment
+                            imported_comments += 1
+                    
+                    # Import line comments within the function
+                    if import_comments and "comments" in func_data:
+                        for addr_str, comment in func_data["comments"].items():
+                            try:
+                                addr = int(addr_str)
+                                if comment and comment.strip():
+                                    log("Setting line comment at 0x{:x}: {}".format(addr, comment[:30] + "..." if len(comment) > 30 else comment))
+                                    existing_func.set_comment_at(addr, comment)
+                                    imported_comments += 1
+                            except (ValueError, TypeError) as e:
+                                log("Warning: Could not parse address {}: {}".format(addr_str, e))
+                                continue
+        
+        # Import standalone symbols/names
+        log("Importing symbol names...")
+        imported_symbols = 0
+        
+        for addr_str, name in names_data.items():
+            try:
+                addr = int(addr_str)
+                if name and not name.startswith("sub_"):
+                    # Check if there's already a function at this address
+                    existing_func = bv.get_function_at(addr)
+                    if existing_func is None:
+                        # Create a symbol
+                        from binaryninja.types import Symbol
+                        from binaryninja.enums import SymbolType
+                        symbol = Symbol(SymbolType.FunctionSymbol, addr, name)
+                        bv.define_user_symbol(symbol)
+                        imported_symbols += 1
+                        log("Created symbol at 0x{:x}: {}".format(addr, name))
+            except (ValueError, TypeError):
+                continue
+        
+        # Final analysis update
+        log("Updating analysis...")
+        bv.update_analysis_and_wait()
+        
+        # Summary
+        log("\n=== Import Summary ===")
+        log("Functions created: {}".format(imported_functions))
+        log("Functions renamed: {}".format(renamed_functions))
+        log("Comments imported: {}".format(imported_comments))
+        log("Symbols created: {}".format(imported_symbols))
+        log("Import completed successfully!")
+        
+        return True, None
+        
+    except FileNotFoundError:
+        return False, "JSON file not found: {}".format(json_file_path)
+    except json.JSONDecodeError as e:
+        return False, "Invalid JSON file: {}".format(str(e))
+    except Exception as e:
+        return False, "Import failed: {}".format(str(e))
 
-    if options.import_strings:
-        log("Importing string types", options.verbose)
-        for addr, (name, length, t, data_refs) in resolved_strings.items():
-            bv.define_user_data_var(int(addr), Type.array(Type.int(1, None, "char"), length))
-            if options.import_strings_names:
-                bv.define_user_symbol(Symbol(SymbolType.DataSymbol, int(addr), name))
-            for ref in data_refs:  # references to this data
-                for block in bv.get_basic_blocks_at(ref):  # find any references in code
-                    for i in block.get_disassembly_text():  # go through all the instructions in the block
-                        if i.address == ref:
-                            for token in i.tokens:
-                                if token.type == InstructionTextTokenType.PossibleAddressToken:
-                                    print "setting token", i.address, token.value, token.operand, IntegerDisplayType.PointerDisplayType, block.arch
-                                    block.function.set_int_display_type(i.address, token.value, token.operand, IntegerDisplayType.PointerDisplayType, block.arch)
-                                    break
 
-    log("Updating Analysis", options.verbose)
-    bv.update_analysis_and_wait()
-    return True, None
-
-
-class GetOptions:
-    def __init__(self, interactive=False):
-        if interactive:
-            import_strings_choice = ChoiceField("Import Strings", ["Yes", "No"])
-            import_string_name_choice = ChoiceField("Import String Names", ["Yes", "No"])
-            import_function_choice = ChoiceField("Import Functions", ["Yes", "No"])
-            import_comment_choice = ChoiceField("Import Comments", ["Yes", "No"])
-            json_file = OpenFileNameField("Import json file")
-            get_form_input([json_file, import_strings_choice, import_string_name_choice, import_function_choice, 
-                import_comment_choice], "IDA Import Options")
-
-            self.import_strings = import_strings_choice.result == 0
-            self.import_strings_names = import_string_name_choice.result == 0
-            self.import_functions = import_function_choice.result == 0
-            self.import_comments = import_comment_choice.result == 0
-            self.verbose = True
-            if json_file.result == '':
-                self.json_file = None
-            else:
-                self.json_file = json_file.result
-            self.output_name = None
-        else:
-            usage = "usage: %prog [options] <ida_export.json> <file|bndb>"
-            parser = OptionParser(usage=usage)
-
-            parser.add_option("-q", "--quiet",
-                dest="verbose",
-                action="store_false",
-                default=True,
-                help="Don't display automatic actions")
-            parser.add_option("-s", "--no-strings",
-                dest="import_strings",
-                action="store_false",
-                default=True,
-                help="Don't import string data")
-            parser.add_option("-n", "--no-string-names",
-                dest="import_strings_names",
-                action="store_false",
-                default=True,
-                help="Don't import string names")
-            parser.add_option("-o", "--output-name",
-                dest="output_name",
-                action="store",
-                default=None,
-                help="Specify output name of bndb. Defaults to <file_name>.bndb")
-            parser.add_option("-f", "--no-functions",
-                dest="import_functions",
-                action="store_false",
-                default=True,
-                help="Don't import function starts")
-            parser.add_option("-c", "--no-comments",
-                dest="import_comments",
-                action="store_false",
-                default=True,
-                help="Don't import comments")
-
-            (options, args) = parser.parse_args()
-            self.import_strings = options.import_strings
-            self.import_strings_names = options.import_strings_names
-            self.import_functions = options.import_functions
-            self.import_comments = options.import_comments
-            self.verbose = options.verbose
-            self.json_file = args[0]
-            self.input_file = args[0]
-            self.output_name = options.output_name
-            if self.output_name is None:
-                self.output_name = self.input_file + ".bndb"
-            self.usage = parser.get_usage()
-
-
-def main():
-    options = GetOptions()
-    if options.json_file is None or options.output_name is None:
-        print options.usage
-        return
-
-    log("Loading the binary: {}".format(options.input_file), options)
-
-    bv = BinaryViewType.get_view_of_file(options.input_file)
+def import_ida_interactive():
+    """Interactive import with GUI dialogs"""
+    # Get current binary view
+    bv = binaryninja.current_view
     if bv is None:
-        print "Could not open {}".format(options.input_file)
-        return False
-
-    (success, error_message) = import_ida(options.json_file, bv, options.output_name, options)
-    if not success:
-        print "Error:", error_message
-        print options.usage
+        print("No binary is currently open. Please open a binary file first.")
         return
+    
+    # Get import options through GUI
+    json_file_field = OpenFileNameField("Select IDA Export JSON file", "*.json")
+    import_functions_choice = ChoiceField("Import Function Names", ["Yes", "No"])
+    import_comments_choice = ChoiceField("Import Comments", ["Yes", "No"])
+    
+    if not get_form_input([json_file_field, import_functions_choice, import_comments_choice], 
+                         "IDA Import Options"):
+        print("Import cancelled")
+        return
+    
+    if not json_file_field.result:
+        print("No JSON file selected")
+        return
+    
+    # Run the import
+    success, error_msg = import_ida_data(
+        bv=bv,
+        json_file_path=json_file_field.result,
+        import_functions=import_functions_choice.result == 0,
+        import_comments=import_comments_choice.result == 0,
+        verbose=True
+    )
+    
+    if not success:
+        print("Import failed: {}".format(error_msg))
 
-    log("Writing out {}".format(options.output_name), options.verbose)
-    bv.create_database(options.output_name)
-    return
+
+def import_ida_script_mode():
+    """Script mode with file dialogs"""
+    # Get JSON file and binary file through GUI
+    json_file_field = OpenFileNameField("Select IDA Export JSON file", "*.json")
+    binary_file_field = OpenFileNameField("Select Binary file to import into")
+    import_functions_choice = ChoiceField("Import Function Names", ["Yes", "No"])
+    import_comments_choice = ChoiceField("Import Comments", ["Yes", "No"])
+    
+    if not get_form_input([json_file_field, binary_file_field, import_functions_choice, import_comments_choice], 
+                         "IDA Import Options"):
+        print("Import cancelled")
+        return
+    
+    if not json_file_field.result or not binary_file_field.result:
+        print("Both JSON file and binary file must be selected")
+        return
+    
+    # Load the binary using Binary Ninja v5.0 API
+    try:
+        print("Loading binary: {}".format(binary_file_field.result))
+        bv = binaryninja.load(binary_file_field.result, update_analysis=True)
+        
+        if bv is None:
+            print("Could not load binary file")
+            return
+            
+        print("Binary loaded successfully")
+        print("Architecture: {}".format(bv.arch.name if bv.arch else "Unknown"))
+        print("Platform: {}".format(bv.platform.name if bv.platform else "Unknown"))
+        
+    except Exception as e:
+        print("Error loading binary: {}".format(e))
+        return
+    
+    # Run the import
+    success, error_msg = import_ida_data(
+        bv=bv,
+        json_file_path=json_file_field.result,
+        import_functions=import_functions_choice.result == 0,
+        import_comments=import_comments_choice.result == 0,
+        verbose=True
+    )
+    
+    if success:
+        # Save the database if it was loaded from a raw binary
+        if not binary_file_field.result.endswith('.bndb'):
+            bndb_path = binary_file_field.result + '.bndb'
+            print("Saving analysis to: {}".format(bndb_path))
+            bv.create_database(bndb_path)
+    else:
+        print("Import failed: {}".format(error_msg))
 
 
-class ImportIDAInBackground(BackgroundTaskThread):
-    def __init__(self, bv, options):
-        global task
-        BackgroundTaskThread.__init__(self, "Importing data from IDA", False)
-        self.json_file = options.json_file
-        self.options = options
-        self.bv = bv
-        task = self
-
-    def run(self):
-        (success, error_message) = import_ida(self.options.json_file, self.bv, self.options)
-        if not success:
-            log_error(error_message)
-
-
-def import_ida_in_background(bv):
-    options = GetOptions(True)
-    background_task = ImportIDAInBackground(bv, options)
-    background_task.start()
-
-
+# Register as plugin command
 if __name__ == "__main__":
-    main()
+    # When run as script, use script mode
+    import_ida_script_mode()
 else:
-    PluginCommand.register("Import data from IDA", "Import data from IDA", import_ida_in_background)
+    # Register as plugin command
+    PluginCommand.register(
+        "Import IDA Analysis Data", 
+        "Import function names and comments from IDA Pro JSON export",
+        import_ida_interactive
+    )
